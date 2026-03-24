@@ -57,7 +57,7 @@ pub struct Connection {
     connection: iroh::endpoint::Connection,
     incoming: Option<BoxFuture<'static, Result<(SendStream, RecvStream), ConnectionError>>>,
     outgoing: Option<BoxFuture<'static, Result<(SendStream, RecvStream), ConnectionError>>>,
-    closing: Option<BoxFuture<'static, ConnectionError>>,
+    closing: Option<BoxFuture<'static, iroh::endpoint::ConnectionError>>,
 }
 
 pub struct Connecting {
@@ -166,21 +166,29 @@ impl StreamMuxer for Connection {
             let connection = this.connection.clone();
             async move {
                 tracing::debug!("Connection::poll_close - Waiting for connection to close");
-                connection.closed().await.into()
+                connection.closed().await
             }
             .boxed()
         });
 
-        if matches!(
-            futures::ready!(closing.poll_unpin(cx)),
-            crate::ConnectionError { .. }
-        ) {
-            tracing::error!("Connection::poll_close - Failed to close connection");
-            return Poll::Ready(Err("failed to close connection".into()));
-        };
-
-        tracing::debug!("Connection::poll_close - Connection closed successfully");
-        Poll::Ready(Ok(()))
+        let close_err = futures::ready!(closing.poll_unpin(cx));
+        // After calling connection.close(0, &[]) the closed() future resolves
+        // with LocallyClosed or ApplicationClosed(code=0). Both indicate a
+        // clean shutdown. Anything else is a real error.
+        match &close_err {
+            iroh::endpoint::ConnectionError::LocallyClosed => {
+                tracing::debug!("Connection::poll_close - Connection closed successfully (locally)");
+                Poll::Ready(Ok(()))
+            }
+            iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code == 0u32.into() => {
+                tracing::debug!("Connection::poll_close - Connection closed successfully (application, code 0)");
+                Poll::Ready(Ok(()))
+            }
+            _ => {
+                tracing::error!("Connection::poll_close - Failed to close connection: {}", close_err);
+                Poll::Ready(Err(close_err.into()))
+            }
+        }
     }
 
     fn poll(

@@ -20,9 +20,12 @@ rand = "0.9"
 
 futures = "0.3"
 futures-timer = "3"
-actor-helper = { version = "0.2", features = ["tokio"] }
 
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
