@@ -177,15 +177,24 @@ impl StreamMuxer for Connection {
         // clean shutdown. Anything else is a real error.
         match &close_err {
             iroh::endpoint::ConnectionError::LocallyClosed => {
-                tracing::debug!("Connection::poll_close - Connection closed successfully (locally)");
+                tracing::debug!(
+                    "Connection::poll_close - Connection closed successfully (locally)"
+                );
                 Poll::Ready(Ok(()))
             }
-            iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code == 0u32.into() => {
-                tracing::debug!("Connection::poll_close - Connection closed successfully (application, code 0)");
+            iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                if close.error_code == 0u32.into() =>
+            {
+                tracing::debug!(
+                    "Connection::poll_close - Connection closed successfully (application, code 0)"
+                );
                 Poll::Ready(Ok(()))
             }
             _ => {
-                tracing::error!("Connection::poll_close - Failed to close connection: {}", close_err);
+                tracing::error!(
+                    "Connection::poll_close - Failed to close connection: {}",
+                    close_err
+                );
                 Poll::Ready(Err(close_err.into()))
             }
         }

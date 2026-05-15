@@ -144,12 +144,11 @@ mod tests {
 
     #[test]
     fn multiaddr_node_id_roundtrip() {
-        let secret = iroh::SecretKey::generate(&mut rand::rng());
+        let secret = iroh::SecretKey::generate();
         let node_id = secret.public();
 
         let multiaddr = iroh_node_id_to_multiaddr(&node_id);
-        let node_id_back =
-            multiaddr_to_iroh_node_id(&multiaddr).expect("multiaddr -> node_id");
+        let node_id_back = multiaddr_to_iroh_node_id(&multiaddr).expect("multiaddr -> node_id");
 
         assert_eq!(node_id, node_id_back);
     }
@@ -158,7 +157,7 @@ mod tests {
     fn multiaddr_with_prefix_extracts_node_id() {
         // Kademlia may store addresses with IP/port prefixes. The transport
         // should still extract the /p2p/ component.
-        let secret = iroh::SecretKey::generate(&mut rand::rng());
+        let secret = iroh::SecretKey::generate();
         let node_id = secret.public();
         let peer_id = node_id_to_peerid(&node_id).expect("node_id -> peer_id");
 

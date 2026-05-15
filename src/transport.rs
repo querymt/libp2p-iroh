@@ -41,7 +41,10 @@ impl std::fmt::Debug for TransportConfig {
         f.debug_struct("TransportConfig")
             .field("relay_mode", &format!("{:?}", self.relay_mode))
             .field("timeout", &self.timeout)
-            .field("peer_filter", &self.peer_filter.as_ref().map(|_| "Some(<fn>)"))
+            .field(
+                "peer_filter",
+                &self.peer_filter.as_ref().map(|_| "Some(<fn>)"),
+            )
             .finish()
     }
 }
@@ -148,7 +151,7 @@ impl Transport {
             (sk, pid)
         } else {
             tracing::debug!("Transport::with_config - Generating new keypair");
-            let sk = iroh::SecretKey::generate(&mut rand::rng());
+            let sk = iroh::SecretKey::generate();
             let node_id = sk.public();
             let node_id_bytes = node_id.as_bytes();
             let ed25519_pubkey = libp2p::identity::ed25519::PublicKey::try_from_bytes(
@@ -178,7 +181,9 @@ impl Transport {
             let transport_events_tx = transport_events_tx.clone();
             let secret_key = secret_key.clone();
             async move {
-                tracing::debug!("Transport::with_config - Spawned task: Initializing iroh endpoint");
+                tracing::debug!(
+                    "Transport::with_config - Spawned task: Initializing iroh endpoint"
+                );
                 if let Ok(endpoint) = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .relay_mode(relay_mode)
@@ -189,7 +194,8 @@ impl Transport {
                     })
                 {
                     tracing::debug!("Transport::with_config - Iroh endpoint created successfully");
-                    let protocol = Protocol::new(endpoint.clone(), transport_events_tx, peer_filter);
+                    let protocol =
+                        Protocol::new(endpoint.clone(), transport_events_tx, peer_filter);
 
                     if waiter_tx.send(Ok((protocol, endpoint))).await.is_ok() {
                         tracing::debug!("Transport::with_config - Protocol sent to waiter channel");
@@ -495,9 +501,9 @@ impl ProtocolHandler for Protocol {
                     remote_node_id
                 );
                 connection.close(From::from(1u32), b"rejected by peer filter");
-                return Err(iroh::protocol::AcceptError::from_err(
-                    TransportError::from("Peer rejected by filter"),
-                ));
+                return Err(iroh::protocol::AcceptError::from_err(TransportError::from(
+                    "Peer rejected by filter",
+                )));
             }
         }
 
@@ -512,14 +518,10 @@ impl ProtocolHandler for Protocol {
         tracing::debug!("Protocol::accept - Remote multiaddr: {}", remote_multi);
         tracing::debug!("Protocol::accept - Local multiaddr: {}", local_multi);
 
-        let listener_id = self
-            .shared_listener_id
-            .lock()
-            .unwrap()
-            .ok_or_else(|| {
-                tracing::error!("Protocol::accept - Listener ID not set");
-                iroh::protocol::AcceptError::from_err(TransportError::from("Listener ID should be set"))
-            })?;
+        let listener_id = self.shared_listener_id.lock().unwrap().ok_or_else(|| {
+            tracing::error!("Protocol::accept - Listener ID not set");
+            iroh::protocol::AcceptError::from_err(TransportError::from("Listener ID should be set"))
+        })?;
 
         tracing::debug!("Protocol::accept - Listener ID: {:?}", listener_id);
 
@@ -538,9 +540,7 @@ impl ProtocolHandler for Protocol {
             })
             .map_err(|e| {
                 tracing::error!("Protocol::accept - Failed to send Incoming event: {}", e);
-                iroh::protocol::AcceptError::from_err(TransportError::from(
-                    e.to_string().as_str(),
-                ))
+                iroh::protocol::AcceptError::from_err(TransportError::from(e.to_string().as_str()))
             })
     }
 }
