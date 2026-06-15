@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
@@ -121,6 +122,16 @@ impl From<&str> for TransportError {
 
 impl std::error::Error for TransportError {}
 
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
 impl Transport {
     /// Create a transport with the default configuration (n0.computer relays, 300s timeout).
     pub async fn new(keypair: Option<&libp2p::identity::Keypair>) -> Result<Self, TransportError> {
@@ -174,52 +185,62 @@ impl Transport {
 
         let relay_mode = config.relay_mode;
         let peer_filter = config.peer_filter;
-        let (waiter_tx, mut waiter_rx) =
-            tokio::sync::mpsc::channel::<Result<(Protocol, iroh::Endpoint), TransportError>>(1);
-
-        tokio::spawn({
+        let init_task = tokio::spawn({
             let transport_events_tx = transport_events_tx.clone();
             let secret_key = secret_key.clone();
             async move {
                 tracing::debug!(
                     "Transport::with_config - Spawned task: Initializing iroh endpoint"
                 );
-                if let Ok(endpoint) = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .relay_mode(relay_mode)
                     .bind()
                     .await
-                    .map_err(|e| TransportError {
-                        kind: TransportErrorKind::Listen(e.to_string()),
-                    })
-                {
-                    tracing::debug!("Transport::with_config - Iroh endpoint created successfully");
-                    let protocol =
-                        Protocol::new(endpoint.clone(), transport_events_tx, peer_filter);
+                    .map_err(|err| {
+                        tracing::error!(
+                            error = %err,
+                            "Transport::with_config - Iroh endpoint bind failed"
+                        );
+                        TransportError {
+                            kind: TransportErrorKind::Listen(format!(
+                                "Failed to initialize iroh endpoint: {err}"
+                            )),
+                        }
+                    })?;
 
-                    if waiter_tx.send(Ok((protocol, endpoint))).await.is_ok() {
-                        tracing::debug!("Transport::with_config - Protocol sent to waiter channel");
-                        return;
-                    }
-                }
-
-                tracing::error!("Transport::with_config - Failed to initialize iroh endpoint");
-                waiter_tx
-                    .send(Err(TransportError {
-                        kind: TransportErrorKind::Listen(
-                            "Failed to initialize iroh endpoint".to_string(),
-                        ),
-                    }))
-                    .await
-                    .expect("fatal: failed to send error through channel");
+                tracing::debug!("Transport::with_config - Iroh endpoint created successfully");
+                let protocol = Protocol::new(endpoint.clone(), transport_events_tx, peer_filter);
+                Ok::<_, TransportError>((protocol, endpoint))
             }
         });
 
-        let (protocol, endpoint) = waiter_rx.recv().await.ok_or_else(|| TransportError {
-            kind: TransportErrorKind::Listen(
-                "Failed to receive transport from initialization".to_string(),
-            ),
-        })??;
+        let (protocol, endpoint) = match init_task.await {
+            Ok(result) => result?,
+            Err(join_error) if join_error.is_panic() => {
+                let panic_message = panic_payload_message(join_error.into_panic());
+                tracing::error!(
+                    panic_message = %panic_message,
+                    "Transport::with_config - Iroh endpoint init task panicked"
+                );
+                return Err(TransportError {
+                    kind: TransportErrorKind::Listen(format!(
+                        "Iroh endpoint init task panicked: {panic_message}"
+                    )),
+                });
+            }
+            Err(join_error) => {
+                tracing::error!(
+                    error = %join_error,
+                    "Transport::with_config - Iroh endpoint init task failed"
+                );
+                return Err(TransportError {
+                    kind: TransportErrorKind::Listen(format!(
+                        "Iroh endpoint init task failed: {join_error}"
+                    )),
+                });
+            }
+        };
 
         tracing::debug!("Transport::with_config - Transport created successfully");
         Ok(Transport {
