@@ -358,6 +358,17 @@ mod tests {
         assert_eq!(transport.node_id, transport.endpoint().id());
         assert_eq!(transport.timeout, std::time::Duration::from_secs(17));
         assert!(transport.endpoint().addr().relay_urls().next().is_none());
+        // This reads the bound endpoint's config, not the config helper's output.
+        let endpoint_config = format!(
+            "{:?}",
+            transport
+                .endpoint()
+                .create_server_config_builder(vec![Protocol::ALPN.to_vec()])
+        );
+        assert!(
+            endpoint_config.contains("enable_segmentation_offload: false"),
+            "bound endpoint did not disable GSO: {endpoint_config}"
+        );
         assert!(Arc::ptr_eq(
             transport.protocol.peer_filter.as_ref().unwrap(),
             &filter
