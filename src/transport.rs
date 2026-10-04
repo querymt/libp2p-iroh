@@ -22,6 +22,9 @@ pub struct TransportConfig {
     pub relay_mode: iroh::RelayMode,
     /// Connection timeout for dial attempts. Defaults to 300s.
     pub timeout: std::time::Duration,
+    /// Enable Generic Segmentation Offload (GSO). Defaults to true.
+    /// Set to false as a compatibility workaround for problematic UDP offload paths.
+    pub enable_gso: bool,
     /// Optional filter: return `true` to accept a peer, `false` to reject.
     /// If `None`, all peers are accepted.
     pub peer_filter: Option<PeerFilter>,
@@ -32,8 +35,17 @@ impl Default for TransportConfig {
         Self {
             relay_mode: iroh::RelayMode::Default,
             timeout: std::time::Duration::from_secs(300),
+            enable_gso: true,
             peer_filter: None,
         }
+    }
+}
+
+impl TransportConfig {
+    fn quic_transport_config(&self) -> iroh::endpoint::QuicTransportConfig {
+        iroh::endpoint::QuicTransportConfig::builder()
+            .enable_segmentation_offload(self.enable_gso)
+            .build()
     }
 }
 
@@ -42,6 +54,7 @@ impl std::fmt::Debug for TransportConfig {
         f.debug_struct("TransportConfig")
             .field("relay_mode", &format!("{:?}", self.relay_mode))
             .field("timeout", &self.timeout)
+            .field("enable_gso", &self.enable_gso)
             .field(
                 "peer_filter",
                 &self.peer_filter.as_ref().map(|_| "Some(<fn>)"),
@@ -183,6 +196,7 @@ impl Transport {
             (sk, pid)
         };
 
+        let quic_transport_config = config.quic_transport_config();
         let relay_mode = config.relay_mode;
         let peer_filter = config.peer_filter;
         let init_task = tokio::spawn({
@@ -195,6 +209,7 @@ impl Transport {
                 let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .relay_mode(relay_mode)
+                    .transport_config(quic_transport_config)
                     .bind()
                     .await
                     .map_err(|err| {
@@ -296,6 +311,62 @@ impl Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gso_defaults_on_preserving_quic_defaults() {
+        let config = TransportConfig::default();
+        assert!(config.enable_gso);
+        assert!(format!("{config:?}").contains("enable_gso: true"));
+        assert_eq!(
+            format!("{:?}", config.quic_transport_config()),
+            format!("{:?}", iroh::endpoint::QuicTransportConfig::default())
+        );
+    }
+
+    #[test]
+    fn gso_off_changes_only_segmentation_offload() {
+        let config = TransportConfig {
+            enable_gso: false,
+            ..Default::default()
+        };
+        // Iroh exposes no getters for these settings; compare its Debug representation.
+        let defaults = format!("{:?}", iroh::endpoint::QuicTransportConfig::default());
+        assert!(defaults.contains("enable_segmentation_offload: true"));
+        assert_eq!(
+            format!("{:?}", config.quic_transport_config()),
+            defaults.replace(
+                "enable_segmentation_offload: true",
+                "enable_segmentation_offload: false"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn gso_off_preserves_identity_timeout_relay_and_peer_filter() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let filter: PeerFilter = Arc::new(|_| false);
+        let config = TransportConfig {
+            relay_mode: iroh::RelayMode::Disabled,
+            timeout: std::time::Duration::from_secs(17),
+            enable_gso: false,
+            peer_filter: Some(filter.clone()),
+        };
+        let transport = Transport::with_config(Some(&keypair), config)
+            .await
+            .unwrap();
+        assert_eq!(transport.peer_id, keypair.public().to_peer_id());
+        assert_eq!(transport.node_id, transport.endpoint().id());
+        assert_eq!(transport.timeout, std::time::Duration::from_secs(17));
+        assert!(transport.endpoint().addr().relay_urls().next().is_none());
+        assert!(Arc::ptr_eq(
+            transport.protocol.peer_filter.as_ref().unwrap(),
+            &filter
+        ));
+        assert!(!(transport.protocol.peer_filter.as_ref().unwrap())(
+            &transport.node_id
+        ));
+        transport.close().await;
+    }
 
     #[tokio::test]
     async fn new_creates_transport_with_default_config() {
