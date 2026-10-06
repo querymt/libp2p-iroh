@@ -58,6 +58,7 @@ pub struct Connection {
     incoming: Option<BoxFuture<'static, Result<(SendStream, RecvStream), ConnectionError>>>,
     outgoing: Option<BoxFuture<'static, Result<(SendStream, RecvStream), ConnectionError>>>,
     closing: Option<BoxFuture<'static, iroh::endpoint::ConnectionError>>,
+    closed: BoxFuture<'static, iroh::endpoint::ConnectionError>,
 }
 
 pub struct Connecting {
@@ -68,11 +69,14 @@ pub struct Connecting {
 impl Connection {
     pub fn new(connection: iroh::endpoint::Connection) -> Self {
         tracing::debug!("Connection::new - Creating new connection wrapper");
+        let closed_connection = connection.clone();
+        let closed = async move { closed_connection.closed().await }.boxed();
         Self {
             connection,
             incoming: None,
             outgoing: None,
             closing: None,
+            closed,
         }
     }
 }
@@ -202,9 +206,11 @@ impl StreamMuxer for Connection {
 
     fn poll(
         self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<libp2p::core::muxing::StreamMuxerEvent, Self::Error>> {
-        Poll::Pending
+        // Report closure even when libp2p applies backpressure to inbound streams.
+        let error = futures::ready!(self.get_mut().closed.poll_unpin(cx));
+        Poll::Ready(Err(error.into()))
     }
 }
 
@@ -235,5 +241,131 @@ impl Future for Connecting {
             peer_id,
             libp2p::core::muxing::StreamMuxerBox::new(muxer),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::ArcWake;
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::Context,
+        time::Duration,
+    };
+
+    #[derive(Default)]
+    struct ClosureWake(AtomicBool);
+
+    impl ArcWake for ClosureWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn local_endpoint() -> iroh::Endpoint {
+        let config = iroh::endpoint::QuicTransportConfig::builder()
+            .enable_segmentation_offload(false)
+            .build();
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![b"/test/muxer-lifecycle".to_vec()])
+            .clear_ip_transports()
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .net_report_config(iroh::endpoint::NetReportConfig::minimal())
+            .transport_config(config)
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    async fn connect_pair(
+        caller: &iroh::Endpoint,
+        receiver: &iroh::Endpoint,
+    ) -> (iroh::endpoint::Connection, iroh::endpoint::Connection) {
+        let addr = iroh::EndpointAddr::new(receiver.id()).with_ip_addr(receiver.bound_sockets()[0]);
+        let (outgoing, incoming) =
+            tokio::join!(caller.connect(addr, b"/test/muxer-lifecycle"), async {
+                receiver.accept().await.unwrap().await.unwrap()
+            },);
+        (outgoing.unwrap(), incoming)
+    }
+
+    #[tokio::test]
+    async fn remote_endpoint_close_wakes_and_invalidates_all_muxers() {
+        let caller = local_endpoint().await;
+        let receiver = local_endpoint().await;
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut connections = Vec::new();
+            // Hold peer connections open until the endpoint is explicitly closed.
+            let mut peer_connections = Vec::new();
+            let mut muxers = Vec::new();
+            for _ in 0..2 {
+                let (outgoing, incoming) = connect_pair(&caller, &receiver).await;
+                assert!(connections.iter().all(|conn: &iroh::endpoint::Connection| {
+                    conn.stable_id() != outgoing.stable_id()
+                }));
+                muxers.push((
+                    Connection::new(outgoing.clone()),
+                    Arc::new(ClosureWake::default()),
+                ));
+                connections.push(outgoing);
+                peer_connections.push(incoming);
+            }
+            // A second wrapper must independently observe the same QUIC connection closing.
+            muxers.push((
+                Connection::new(connections[0].clone()),
+                Arc::new(ClosureWake::default()),
+            ));
+            for (muxer, wake) in &mut muxers {
+                let waker = futures::task::waker(wake.clone());
+                assert!(
+                    Pin::new(muxer)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                wake.0.store(false, Ordering::SeqCst);
+            }
+
+            receiver.close().await;
+            for connection in &connections {
+                assert!(matches!(
+                    connection.closed().await,
+                    iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                        if close.error_code == 0u32.into()
+                ));
+            }
+            for (muxer, wake) in &mut muxers {
+                assert!(
+                    wake.0.load(Ordering::SeqCst),
+                    "remote closure must wake every pending muxer without a timer repoll"
+                );
+                let waker = futures::task::waker(wake.clone());
+                assert!(
+                    matches!(
+                        Pin::new(muxer).poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(_))
+                    ),
+                    "known-closed QUIC connections must invalidate every muxer"
+                );
+            }
+            let mut late_muxer = Connection::new(connections[0].clone());
+            assert!(
+                matches!(
+                    Pin::new(&mut late_muxer)
+                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref())),
+                    Poll::Ready(Err(_))
+                ),
+                "a muxer first polled after closure must immediately fail"
+            );
+        })
+        .await;
+        tokio::join!(caller.close(), receiver.close());
+        result.expect("local QUIC lifecycle exceeded 3 seconds");
     }
 }
