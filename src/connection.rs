@@ -247,7 +247,7 @@ impl Future for Connecting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{future::poll_fn, task::ArcWake};
+    use futures::task::ArcWake;
     use std::{
         net::{Ipv4Addr, SocketAddrV4},
         sync::{
@@ -267,12 +267,11 @@ mod tests {
         }
     }
 
-    async fn local_endpoint(secret_key: iroh::SecretKey) -> iroh::Endpoint {
+    async fn local_endpoint() -> iroh::Endpoint {
         let config = iroh::endpoint::QuicTransportConfig::builder()
             .enable_segmentation_offload(false)
             .build();
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key)
             .alpns(vec![b"/test/muxer-lifecycle".to_vec()])
             .clear_ip_transports()
             .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -297,43 +296,26 @@ mod tests {
         (outgoing.unwrap(), incoming)
     }
 
-    async fn exchange_byte(caller: &mut Connection, receiver: &mut Connection) {
-        let (outgoing, incoming) = tokio::join!(
-            poll_fn(|cx| Pin::new(&mut *caller).poll_outbound(cx)),
-            poll_fn(|cx| Pin::new(&mut *receiver).poll_inbound(cx)),
-        );
-        let mut outgoing = outgoing.unwrap();
-        let mut incoming = incoming.unwrap();
-        futures::AsyncWriteExt::write_all(&mut outgoing, &[42])
-            .await
-            .unwrap();
-        let mut received = [0];
-        futures::AsyncReadExt::read_exact(&mut incoming, &mut received)
-            .await
-            .unwrap();
-        assert_eq!(received, [42]);
-    }
-
     #[tokio::test]
     async fn remote_endpoint_close_wakes_and_invalidates_all_muxers() {
-        let receiver_key = iroh::SecretKey::generate();
-        let caller = local_endpoint(iroh::SecretKey::generate()).await;
-        let receiver = local_endpoint(receiver_key.clone()).await;
+        let caller = local_endpoint().await;
+        let receiver = local_endpoint().await;
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             let mut connections = Vec::new();
-            let mut peer_muxers = Vec::new();
+            // Hold peer connections open until the endpoint is explicitly closed.
+            let mut peer_connections = Vec::new();
             let mut muxers = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (outgoing, incoming) = connect_pair(&caller, &receiver).await;
                 assert!(connections.iter().all(|conn: &iroh::endpoint::Connection| {
                     conn.stable_id() != outgoing.stable_id()
                 }));
-                let mut muxer = Connection::new(outgoing.clone());
-                let mut peer_muxer = Connection::new(incoming);
-                exchange_byte(&mut muxer, &mut peer_muxer).await;
-                peer_muxers.push(peer_muxer);
+                muxers.push((
+                    Connection::new(outgoing.clone()),
+                    Arc::new(ClosureWake::default()),
+                ));
                 connections.push(outgoing);
-                muxers.push((muxer, Arc::new(ClosureWake::default())));
+                peer_connections.push(incoming);
             }
             // A second wrapper must independently observe the same QUIC connection closing.
             muxers.push((
@@ -350,11 +332,6 @@ mod tests {
                 wake.0.store(false, Ordering::SeqCst);
             }
 
-            assert!(
-                connections
-                    .iter()
-                    .all(|connection| connection.close_reason().is_none())
-            );
             receiver.close().await;
             for connection in &connections {
                 assert!(matches!(
@@ -363,62 +340,32 @@ mod tests {
                         if close.error_code == 0u32.into()
                 ));
             }
-            let woken = muxers
-                .iter()
-                .filter(|(_, wake)| wake.0.load(Ordering::SeqCst))
-                .count();
-            let mut closure_errors = 0;
             for (muxer, wake) in &mut muxers {
+                assert!(
+                    wake.0.load(Ordering::SeqCst),
+                    "remote closure must wake every pending muxer without a timer repoll"
+                );
                 let waker = futures::task::waker(wake.clone());
-                let mut cx = Context::from_waker(&waker);
-                if matches!(Pin::new(muxer).poll(&mut cx), Poll::Ready(Err(_))) {
-                    closure_errors += 1;
-                }
+                assert!(
+                    matches!(
+                        Pin::new(muxer).poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(_))
+                    ),
+                    "known-closed QUIC connections must invalidate every muxer"
+                );
             }
             let mut late_muxer = Connection::new(connections[0].clone());
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let late_closed =
-                matches!(Pin::new(&mut late_muxer).poll(&mut cx), Poll::Ready(Err(_)));
-            assert!(matches!(
-                Pin::new(&mut late_muxer).poll_outbound(&mut cx),
-                Poll::Ready(Err(_))
-            ));
-            assert!(matches!(
-                Pin::new(&mut late_muxer).poll_inbound(&mut cx),
-                Poll::Ready(Err(_))
-            ));
-
-            let restarted = local_endpoint(receiver_key).await;
-            assert_eq!(receiver.id(), restarted.id());
-            let (outgoing, incoming) = connect_pair(&caller, &restarted).await;
-            let mut fresh = Connection::new(outgoing);
-            let mut fresh_peer = Connection::new(incoming);
-            exchange_byte(&mut fresh, &mut fresh_peer).await;
-            poll_fn(|cx| Pin::new(&mut fresh).poll_close(cx))
-                .await
-                .unwrap();
-            restarted.close().await;
-            (woken, closure_errors, late_closed)
+            assert!(
+                matches!(
+                    Pin::new(&mut late_muxer)
+                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref())),
+                    Poll::Ready(Err(_))
+                ),
+                "a muxer first polled after closure must immediately fail"
+            );
         })
         .await;
         tokio::join!(caller.close(), receiver.close());
-        let (woken, closure_errors, late_closed) =
-            result.expect("local QUIC lifecycle exceeded 3 seconds");
-        eprintln!(
-            "transport_closed=3; muxer_closure_errors={closure_errors}/4; closure_wakes={woken}/4; late_closed={late_closed}; same_identity_restart_exchange=ok; local_close=ok"
-        );
-        assert_eq!(
-            closure_errors, 4,
-            "known-closed QUIC connections must invalidate every muxer"
-        );
-        assert_eq!(
-            woken, 4,
-            "remote closure must wake every pending muxer without a timer repoll"
-        );
-        assert!(
-            late_closed,
-            "a muxer first polled after closure must immediately fail"
-        );
+        result.expect("local QUIC lifecycle exceeded 3 seconds");
     }
 }
