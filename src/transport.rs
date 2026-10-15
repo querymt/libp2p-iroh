@@ -25,6 +25,9 @@ pub struct TransportConfig {
     /// Enable Generic Segmentation Offload (GSO). Defaults to true.
     /// Set to false as a compatibility workaround for problematic UDP offload paths.
     pub enable_gso: bool,
+    /// Optional DNS resolver for relay and endpoint address lookups.
+    /// None preserves iroh's system DNS and deferred public fallback defaults.
+    pub dns_resolver: Option<iroh::dns::DnsResolver>,
     /// Optional filter: return `true` to accept a peer, `false` to reject.
     /// If `None`, all peers are accepted.
     pub peer_filter: Option<PeerFilter>,
@@ -36,6 +39,7 @@ impl Default for TransportConfig {
             relay_mode: iroh::RelayMode::Default,
             timeout: std::time::Duration::from_secs(300),
             enable_gso: true,
+            dns_resolver: None,
             peer_filter: None,
         }
     }
@@ -55,6 +59,7 @@ impl std::fmt::Debug for TransportConfig {
             .field("relay_mode", &format!("{:?}", self.relay_mode))
             .field("timeout", &self.timeout)
             .field("enable_gso", &self.enable_gso)
+            .field("dns_resolver", &self.dns_resolver)
             .field(
                 "peer_filter",
                 &self.peer_filter.as_ref().map(|_| "Some(<fn>)"),
@@ -198,6 +203,7 @@ impl Transport {
 
         let quic_transport_config = config.quic_transport_config();
         let relay_mode = config.relay_mode;
+        let dns_resolver = config.dns_resolver;
         let peer_filter = config.peer_filter;
         let init_task = tokio::spawn({
             let transport_events_tx = transport_events_tx.clone();
@@ -206,23 +212,24 @@ impl Transport {
                 tracing::debug!(
                     "Transport::with_config - Spawned task: Initializing iroh endpoint"
                 );
-                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                     .secret_key(secret_key)
                     .relay_mode(relay_mode)
-                    .transport_config(quic_transport_config)
-                    .bind()
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(
-                            error = %err,
-                            "Transport::with_config - Iroh endpoint bind failed"
-                        );
-                        TransportError {
-                            kind: TransportErrorKind::Listen(format!(
-                                "Failed to initialize iroh endpoint: {err}"
-                            )),
-                        }
-                    })?;
+                    .transport_config(quic_transport_config);
+                if let Some(resolver) = dns_resolver {
+                    builder = builder.dns_resolver(resolver);
+                }
+                let endpoint = builder.bind().await.map_err(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "Transport::with_config - Iroh endpoint bind failed"
+                    );
+                    TransportError {
+                        kind: TransportErrorKind::Listen(format!(
+                            "Failed to initialize iroh endpoint: {err}"
+                        )),
+                    }
+                })?;
 
                 tracing::debug!("Transport::with_config - Iroh endpoint created successfully");
                 let protocol = Protocol::new(endpoint.clone(), transport_events_tx, peer_filter);
@@ -312,6 +319,134 @@ impl Protocol {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn custom_dns_resolver_is_used_by_bound_endpoint() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = iroh::dns::DnsResolver::builder()
+            .disable_fallback()
+            .add_nameserver_config(
+                iroh::dns::NameserverConfig::udp(socket.local_addr().unwrap().ip())
+                    .with_port(socket.local_addr().unwrap().port()),
+            )
+            .build();
+        let server = tokio::spawn(async move {
+            let mut packet = [0u8; 512];
+            loop {
+                let (len, peer) = socket.recv_from(&mut packet).await.unwrap();
+                // N0 may resolve its publisher concurrently; only answer our test's A query.
+                let mut end = 12;
+                while packet[end] != 0 {
+                    end += 1 + usize::from(packet[end]);
+                }
+                end += 5; // Root label, question type, and class.
+                assert!(end <= len);
+                if &packet[12..end] != b"\x07adapter\x04test\x00\x00\x01\x00\x01" {
+                    continue;
+                }
+                let mut response = packet[..end].to_vec();
+                response[2..4].copy_from_slice(&[0x81, 0x80]);
+                response[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
+                response
+                    .extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 42]);
+                socket.send_to(&response, peer).await.unwrap();
+                break;
+            }
+        });
+        let transport = Transport::with_config(
+            None,
+            TransportConfig {
+                relay_mode: iroh::RelayMode::Disabled,
+                dns_resolver: Some(resolver),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ips: Vec<_> = transport
+            .endpoint()
+            .dns_resolver()
+            .unwrap()
+            .lookup_ipv4("adapter.test", std::time::Duration::from_secs(2))
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(ips, vec!["127.0.0.42".parse::<std::net::IpAddr>().unwrap()]);
+        server.await.unwrap();
+        transport.close().await;
+    }
+
+    #[derive(Debug)]
+    struct FailingLookup;
+
+    impl iroh::address_lookup::AddressLookup for FailingLookup {
+        fn resolve(
+            &self,
+            _id: iroh::EndpointId,
+        ) -> Option<
+            futures::stream::BoxStream<
+                'static,
+                Result<iroh::address_lookup::Item, iroh::address_lookup::Error>,
+            >,
+        > {
+            use futures::StreamExt as _;
+            Some(
+                futures::stream::once(async {
+                    Err(iroh::address_lookup::Error::from_err(
+                        "failing-test",
+                        std::io::Error::other("simulated lookup failure"),
+                    ))
+                })
+                .boxed(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_id_dial_survives_failed_lookup_and_offline_peer() {
+        use iroh::address_lookup::{EndpointInfo, MemoryLookup};
+        use std::time::Duration;
+        let transport = Transport::with_config(
+            None,
+            TransportConfig {
+                relay_mode: iroh::RelayMode::Disabled,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let endpoint = transport.endpoint();
+        let lookup = endpoint.address_lookup().unwrap();
+        lookup.clear();
+        lookup.add(FailingLookup);
+        let memory = MemoryLookup::new();
+        lookup.add(memory.clone());
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![b"lookup-test".to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        memory.add_endpoint_info(EndpointInfo::from(server.addr()));
+        let offline_id = iroh::SecretKey::generate().public();
+        let offline = endpoint.connect(offline_id, b"lookup-test");
+        let online = endpoint.connect(server.id(), b"lookup-test");
+        let exchange = async {
+            let (offline, online, accepted) = tokio::join!(offline, online, async {
+                server.accept().await.unwrap().await.unwrap()
+            });
+            assert!(offline.is_err());
+            let online = online.unwrap();
+            assert_eq!(online.remote_id(), server.id());
+            assert_eq!(accepted.remote_id(), endpoint.id());
+        };
+        tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .unwrap();
+        transport.close().await;
+        server.close().await;
+    }
+
     #[test]
     fn gso_defaults_on_preserving_quic_defaults() {
         let config = TransportConfig::default();
@@ -350,6 +485,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(17),
             enable_gso: false,
             peer_filter: Some(filter.clone()),
+            dns_resolver: None,
         };
         let transport = Transport::with_config(Some(&keypair), config)
             .await

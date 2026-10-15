@@ -142,6 +142,35 @@ The transport automatically handles the conversion between libp2p PeerIds and ir
 ## Features
 
 - `swarm` (default): Includes libp2p-swarm and libp2p-kad dependencies for the examples.
+- `metrics` (opt-in): Enables iroh relay and address-lookup counters, accessible
+  through `transport.endpoint().metrics()`.
+
+The transport requires iroh 1.3 or newer. Its N0 preset publishes and resolves
+endpoint addresses using public pkarr services and resolves through DNS as well.
+An optional `TransportConfig::dns_resolver` overrides the endpoint's DNS resolver:
+
+```rust
+let resolver = iroh::dns::DnsResolver::builder()
+    .with_system_defaults()
+    .disable_fallback()
+    .build();
+let config = libp2p_iroh::TransportConfig {
+    dns_resolver: Some(resolver),
+    ..Default::default()
+};
+```
+
+`None` preserves system DNS with deferred public fallback. Disabling DNS fallback
+does not disable N0's public pkarr services or relays. Custom DNS applies before
+endpoint bind, including relay and endpoint lookups. Exhaustive `TransportConfig`
+literals must add `dns_resolver: None` to preserve existing behavior.
+
+Relay health is available without metrics through
+`transport.endpoint().home_relay_status()` (import `iroh::Watcher` to read it).
+Authentication denial is a relay policy error, not a libp2p peer or application
+admission failure. A disconnected relay does not imply existing direct connections
+are broken. The transport continues to use reliable QUIC streams; application
+datagram batching is not a replacement for `StreamMuxer` semantics.
 
 Disable default features if you only need the transport:
 
